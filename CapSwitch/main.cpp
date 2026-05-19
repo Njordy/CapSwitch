@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cwchar>
+#include <vector>
 
 namespace {
 
@@ -29,10 +30,8 @@ HANDLE g_mutex = nullptr;
 NOTIFYICONDATAW g_tray = {};
 
 std::atomic_bool g_enabled{ true };
-std::atomic<DWORD> g_lastHookTick{ 0 };
 std::atomic_bool g_capsDown{ false };
 std::atomic_bool g_ctrlDown{ false };
-std::atomic_bool g_shiftDown{ false };
 
 bool g_debug = false;
 bool g_noTray = false;
@@ -43,9 +42,9 @@ void DebugLog(const wchar_t* text)
         return;
     }
 
-    wchar_t path[MAX_PATH] = {};
-    const DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
+    wchar_t path[1024] = {};
+    const DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", path, 1024);
+    if (len == 0 || len >= (1024 - 32)) {
         return;
     }
 
@@ -63,7 +62,7 @@ void DebugLog(const wchar_t* text)
     GetLocalTime(&st);
 
     wchar_t line[512] = {};
-    swprintf_s(line, L"%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
+    _snwprintf_s(line, sizeof(line) / sizeof(line[0]), _TRUNCATE, L"%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
         st.wMilliseconds, text);
 
@@ -102,7 +101,6 @@ void ResetInputState()
 {
     g_capsDown.store(false);
     g_ctrlDown.store((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
-    g_shiftDown.store((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
 }
 
 HWND GetLayoutTargetWindow()
@@ -114,11 +112,12 @@ HWND GetLayoutTargetWindow()
 
     HWND focus = nullptr;
     DWORD targetThread = GetWindowThreadProcessId(foreground, nullptr);
-    DWORD currentThread = GetCurrentThreadId();
-
-    if (targetThread != 0 && AttachThreadInput(currentThread, targetThread, TRUE)) {
-        focus = GetFocus();
-        AttachThreadInput(currentThread, targetThread, FALSE);
+    if (targetThread != 0) {
+        GUITHREADINFO gti = {};
+        gti.cbSize = sizeof(GUITHREADINFO);
+        if (GetGUIThreadInfo(targetThread, &gti) && gti.hwndFocus) {
+            focus = gti.hwndFocus;
+        }
     }
 
     return focus ? focus : foreground;
@@ -131,8 +130,8 @@ HKL GetNextKeyboardLayout(DWORD threadId)
         return nullptr;
     }
 
-    HKL layouts[32] = {};
-    const int stored = GetKeyboardLayoutList(static_cast<int>(sizeof(layouts) / sizeof(layouts[0])), layouts);
+    std::vector<HKL> layouts(count);
+    const int stored = GetKeyboardLayoutList(count, layouts.data());
     if (stored <= 1) {
         return nullptr;
     }
@@ -162,6 +161,11 @@ void SwitchLayout()
     }
 
     DWORD threadId = GetWindowThreadProcessId(foreground, nullptr);
+    if (threadId == 0) {
+        DebugLog(L"Failed to get thread ID for foreground window");
+        return;
+    }
+
     HKL nextLayout = GetNextKeyboardLayout(threadId);
     if (!nextLayout) {
         DebugLog(L"No next keyboard layout found");
@@ -169,10 +173,9 @@ void SwitchLayout()
     }
 
     HWND target = GetLayoutTargetWindow();
-    if (target && target != foreground) {
+    if (target) {
         PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(nextLayout));
     }
-    PostMessageW(foreground, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(nextLayout));
     DebugLog(L"Switch layout requested");
 }
 
@@ -206,6 +209,15 @@ bool IsStartupEnabled()
 
     if (status != ERROR_SUCCESS) {
         return false;
+    }
+
+    // Ensure safe null-termination
+    const DWORD maxChars = sizeof(value) / sizeof(value[0]);
+    const DWORD charsWritten = valueSize / sizeof(wchar_t);
+    if (charsWritten < maxChars) {
+        value[charsWritten] = L'\0';
+    } else {
+        value[maxChars - 1] = L'\0';
     }
 
     wchar_t exePath[MAX_PATH] = {};
@@ -281,19 +293,12 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
     }
 
     auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-    if ((key->flags & LLKHF_INJECTED) && key->dwExtraInfo == kInjectedMarker) {
+    if (!key || ((key->flags & LLKHF_INJECTED) && key->dwExtraInfo == kInjectedMarker)) {
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
-
-    g_lastHookTick.store(GetTickCount());
 
     if (IsCtrlKey(key->vkCode)) {
         g_ctrlDown.store(IsKeyDownMessage(wParam));
-        return CallNextHookEx(g_hook, code, wParam, lParam);
-    }
-
-    if (IsShiftKey(key->vkCode)) {
-        g_shiftDown.store(IsKeyDownMessage(wParam));
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
@@ -336,7 +341,6 @@ bool InstallHook()
     }
 
     g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_instance, 0);
-    g_lastHookTick.store(GetTickCount());
     DebugLog(g_hook ? L"Hook installed" : L"Hook install failed");
     return g_hook != nullptr;
 }
@@ -413,7 +417,7 @@ void ShowTrayMenu()
 
 void WatchdogTick()
 {
-    static DWORD lastReinstall = 0;
+    static DWORD lastReinstall = GetTickCount();
     const DWORD now = GetTickCount();
 
     ForceCapsLockOff();
@@ -525,6 +529,9 @@ bool CreateMessageWindow()
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+    // Enable Per-Monitor DPI Awareness V2 for crisp tray menus and dialogs
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     g_instance = instance;
     ParseCommandLine();
 
