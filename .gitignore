@@ -1,0 +1,19 @@
+# Build folders
+[Xx]64/
+[Xx]86/
+[Dd]ebug/
+[Rr]elease/
+
+# Visual Studio cache and configuration
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.opensdf
+*.sdf
+*.ipch
+*.db
+*.opendb
+*.tlog
+*.log
