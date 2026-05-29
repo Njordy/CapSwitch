@@ -32,9 +32,8 @@ application receives it.
 Layout switching is requested directly from the foreground window:
 
 1. Read the foreground window and its input thread.
-2. Read installed keyboard layouts with `GetKeyboardLayoutList`.
-3. Pick the next `HKL`.
-4. Post `WM_INPUTLANGCHANGEREQUEST` to the foreground/focused target.
+2. Find the focused child window when Windows exposes it.
+3. Post `WM_INPUTLANGCHANGEREQUEST` with `HKL_NEXT` to both focused and foreground targets.
 
 Synthetic keyboard input is used only for one thing: forcing CapsLock off if the
 system state becomes enabled.
@@ -47,6 +46,7 @@ callback small and adds recovery logic:
 
 - a watchdog checks CapsLock state every 500 ms;
 - the watchdog periodically reinstalls the keyboard hook;
+- enable/disable also reinstalls the keyboard hook;
 - injected cleanup keystrokes are marked and ignored by the hook;
 - stale internal key state is reset if a key-up event is lost;
 - the tray menu exposes `Reload keyboard hook` for manual recovery.

@@ -5,7 +5,6 @@
 
 #include <atomic>
 #include <cwchar>
-#include <vector>
 
 namespace {
 
@@ -15,6 +14,7 @@ constexpr wchar_t kWindowClass[] = L"CapSwitch.MessageWindow";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCmdSwitchLayout = WM_APP + 2;
 constexpr UINT kCmdToggleEnabled = WM_APP + 3;
+constexpr UINT kCmdForceCapsOff = WM_APP + 4;
 constexpr UINT kMenuToggleEnabled = 1001;
 constexpr UINT kMenuReloadHook = 1002;
 constexpr UINT kMenuToggleStartup = 1003;
@@ -32,9 +32,12 @@ NOTIFYICONDATAW g_tray = {};
 std::atomic_bool g_enabled{ true };
 std::atomic_bool g_capsDown{ false };
 std::atomic_bool g_ctrlDown{ false };
+std::atomic<DWORD> g_capsDownTick{ 0 };
 
 bool g_debug = false;
 bool g_noTray = false;
+
+bool InstallHook();
 
 void DebugLog(const wchar_t* text)
 {
@@ -100,6 +103,7 @@ void ForceCapsLockOff()
 void ResetInputState()
 {
     g_capsDown.store(false);
+    g_capsDownTick.store(0);
     g_ctrlDown.store((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
 }
 
@@ -123,27 +127,13 @@ HWND GetLayoutTargetWindow()
     return focus ? focus : foreground;
 }
 
-HKL GetNextKeyboardLayout(DWORD threadId)
+void RequestLayoutSwitch(HWND hwnd)
 {
-    const int count = GetKeyboardLayoutList(0, nullptr);
-    if (count <= 1) {
-        return nullptr;
+    if (!hwnd) {
+        return;
     }
 
-    std::vector<HKL> layouts(count);
-    const int stored = GetKeyboardLayoutList(count, layouts.data());
-    if (stored <= 1) {
-        return nullptr;
-    }
-
-    HKL current = GetKeyboardLayout(threadId);
-    for (int i = 0; i < stored; ++i) {
-        if (layouts[i] == current) {
-            return layouts[(i + 1) % stored];
-        }
-    }
-
-    return layouts[0];
+    PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, static_cast<LPARAM>(static_cast<LONG_PTR>(HKL_NEXT)));
 }
 
 void SwitchLayout()
@@ -166,16 +156,11 @@ void SwitchLayout()
         return;
     }
 
-    HKL nextLayout = GetNextKeyboardLayout(threadId);
-    if (!nextLayout) {
-        DebugLog(L"No next keyboard layout found");
-        return;
-    }
-
     HWND target = GetLayoutTargetWindow();
-    if (target) {
-        PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(nextLayout));
+    if (target && target != foreground) {
+        RequestLayoutSwitch(target);
     }
+    RequestLayoutSwitch(foreground);
     DebugLog(L"Switch layout requested");
 }
 
@@ -183,6 +168,8 @@ void ToggleEnabled()
 {
     const bool enabled = !g_enabled.load();
     g_enabled.store(enabled);
+    InstallHook();
+    ResetInputState();
     ForceCapsLockOff();
     DebugLog(enabled ? L"Enabled" : L"Disabled");
 }
@@ -306,10 +293,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
-    ForceCapsLockOff();
+    PostMessageW(g_window, kCmdForceCapsOff, 0, 0);
 
     if (IsKeyUpMessage(wParam)) {
         g_capsDown.store(false);
+        g_capsDownTick.store(0);
         return 1;
     }
 
@@ -320,6 +308,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
     if (g_capsDown.exchange(true)) {
         return 1;
     }
+    g_capsDownTick.store(GetTickCount());
 
     const bool ctrlDown =
         g_ctrlDown.load() || (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -422,13 +411,16 @@ void WatchdogTick()
 
     ForceCapsLockOff();
 
-    if (!g_hook || now - lastReinstall > 30000) {
+    if (!g_hook || now - lastReinstall > 5000) {
         InstallHook();
         lastReinstall = now;
     }
 
-    if (g_capsDown.load() && (GetAsyncKeyState(VK_CAPITAL) & 0x8000) == 0) {
+    const DWORD capsTick = g_capsDownTick.load();
+    if (g_capsDown.load() &&
+        ((GetAsyncKeyState(VK_CAPITAL) & 0x8000) == 0 || (capsTick != 0 && now - capsTick > 1500))) {
         g_capsDown.store(false);
+        g_capsDownTick.store(0);
     }
 }
 
@@ -441,6 +433,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case kCmdToggleEnabled:
         ToggleEnabled();
         UpdateTrayIcon();
+        return 0;
+    case kCmdForceCapsOff:
+        ForceCapsLockOff();
         return 0;
     case kTrayMessage:
         if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP) {
