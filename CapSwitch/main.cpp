@@ -19,25 +19,51 @@ constexpr UINT kMenuToggleEnabled = 1001;
 constexpr UINT kMenuReloadHook = 1002;
 constexpr UINT kMenuToggleStartup = 1003;
 constexpr UINT kMenuExit = 1004;
+constexpr UINT kMenuMethodMsg = 1010;
+constexpr UINT kMenuMethodAltShift = 1011;
+constexpr UINT kMenuMethodCtrlShift = 1012;
+constexpr UINT kMenuMethodWinSpace = 1013;
+constexpr UINT kMenuToggleDebug = 1014;
+constexpr UINT kMenuOpenLog = 1015;
 constexpr UINT kTimerWatchdog = 1;
-constexpr UINT kTimerResetState = 2;
 constexpr ULONG_PTR kInjectedMarker = 0x435357544348ULL;
+
+enum SwitchMethod : DWORD {
+    SwitchMethodMessage = 0,
+    SwitchMethodAltShift = 1,
+    SwitchMethodCtrlShift = 2,
+    SwitchMethodWinSpace = 3,
+};
 
 HINSTANCE g_instance = nullptr;
 HWND g_window = nullptr;
 HHOOK g_hook = nullptr;
 HANDLE g_mutex = nullptr;
 NOTIFYICONDATAW g_tray = {};
+UINT g_taskbarCreatedMessage = 0;
 
 std::atomic_bool g_enabled{ true };
 std::atomic_bool g_capsDown{ false };
-std::atomic_bool g_ctrlDown{ false };
 std::atomic<DWORD> g_capsDownTick{ 0 };
+std::atomic<DWORD> g_switchMethod{ SwitchMethodMessage };
 
 bool g_debug = false;
 bool g_noTray = false;
 
 bool InstallHook();
+
+bool GetLogFilePath(wchar_t* path, DWORD pathCount)
+{
+    const DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", path, pathCount);
+    if (len == 0 || len >= pathCount - 32) {
+        return false;
+    }
+
+    wcscat_s(path, pathCount, L"\\CapSwitch");
+    CreateDirectoryW(path, nullptr);
+    wcscat_s(path, pathCount, L"\\CapSwitch.log");
+    return true;
+}
 
 void DebugLog(const wchar_t* text)
 {
@@ -46,14 +72,9 @@ void DebugLog(const wchar_t* text)
     }
 
     wchar_t path[1024] = {};
-    const DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", path, 1024);
-    if (len == 0 || len >= (1024 - 32)) {
+    if (!GetLogFilePath(path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])))) {
         return;
     }
-
-    wcscat_s(path, L"\\CapSwitch");
-    CreateDirectoryW(path, nullptr);
-    wcscat_s(path, L"\\CapSwitch.log");
 
     HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -104,7 +125,6 @@ void ResetInputState()
 {
     g_capsDown.store(false);
     g_capsDownTick.store(0);
-    g_ctrlDown.store((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
 }
 
 HWND GetLayoutTargetWindow()
@@ -136,6 +156,71 @@ void RequestLayoutSwitch(HWND hwnd)
     PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, static_cast<LPARAM>(static_cast<LONG_PTR>(HKL_NEXT)));
 }
 
+const wchar_t* GetSwitchMethodName(DWORD method)
+{
+    switch (method) {
+    case SwitchMethodMessage:
+        return L"Window Message";
+    case SwitchMethodAltShift:
+        return L"Alt+Shift";
+    case SwitchMethodCtrlShift:
+        return L"Ctrl+Shift";
+    case SwitchMethodWinSpace:
+        return L"Win+Space";
+    default:
+        return L"Unknown";
+    }
+}
+
+void SimulateKeyCombo(const WORD* keys, int count)
+{
+    if (!keys || count <= 0 || count > 8) {
+        return;
+    }
+
+    INPUT inputs[16] = {};
+    int inputCount = 0;
+    for (int i = 0; i < count; ++i) {
+        inputs[inputCount].type = INPUT_KEYBOARD;
+        inputs[inputCount].ki.wVk = keys[i];
+        inputs[inputCount].ki.dwExtraInfo = kInjectedMarker;
+        ++inputCount;
+    }
+
+    for (int i = count - 1; i >= 0; --i) {
+        inputs[inputCount].type = INPUT_KEYBOARD;
+        inputs[inputCount].ki.wVk = keys[i];
+        inputs[inputCount].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs[inputCount].ki.dwExtraInfo = kInjectedMarker;
+        ++inputCount;
+    }
+
+    SendInput(static_cast<UINT>(inputCount), inputs, sizeof(INPUT));
+}
+
+void LogSwitchDiagnostics(HWND foreground, HWND target, DWORD threadId, DWORD method)
+{
+    if (!g_debug) {
+        return;
+    }
+
+    wchar_t title[256] = {};
+    wchar_t className[128] = {};
+    GetWindowTextW(foreground, title, static_cast<int>(sizeof(title) / sizeof(title[0])));
+    GetClassNameW(foreground, className, static_cast<int>(sizeof(className) / sizeof(className[0])));
+
+    DWORD processId = 0;
+    GetWindowThreadProcessId(foreground, &processId);
+    HKL currentLayout = GetKeyboardLayout(threadId);
+
+    wchar_t line[768] = {};
+    _snwprintf_s(line, sizeof(line) / sizeof(line[0]), _TRUNCATE,
+        L"SwitchLayout method=%s hwnd=0x%p target=0x%p pid=%lu tid=%lu hkl=0x%p class=\"%s\" title=\"%s\"",
+        GetSwitchMethodName(method), foreground, target, processId, threadId,
+        currentLayout, className, title);
+    DebugLog(line);
+}
+
 void SwitchLayout()
 {
     if (!g_enabled.load()) {
@@ -157,10 +242,35 @@ void SwitchLayout()
     }
 
     HWND target = GetLayoutTargetWindow();
-    if (target && target != foreground) {
-        RequestLayoutSwitch(target);
+    if (!target) {
+        target = foreground;
     }
-    RequestLayoutSwitch(foreground);
+
+    const DWORD method = g_switchMethod.load();
+    LogSwitchDiagnostics(foreground, target, threadId, method);
+
+    switch (method) {
+    case SwitchMethodAltShift: {
+        const WORD keys[] = { VK_LMENU, VK_LSHIFT };
+        SimulateKeyCombo(keys, 2);
+        break;
+    }
+    case SwitchMethodCtrlShift: {
+        const WORD keys[] = { VK_LCONTROL, VK_LSHIFT };
+        SimulateKeyCombo(keys, 2);
+        break;
+    }
+    case SwitchMethodWinSpace: {
+        const WORD keys[] = { VK_LWIN, VK_SPACE };
+        SimulateKeyCombo(keys, 2);
+        break;
+    }
+    case SwitchMethodMessage:
+    default:
+        RequestLayoutSwitch(target);
+        break;
+    }
+
     DebugLog(L"Switch layout requested");
 }
 
@@ -253,14 +363,48 @@ bool SetStartupEnabled(bool enabled)
     return status == ERROR_SUCCESS;
 }
 
-bool IsCtrlKey(WPARAM vk)
+void LoadSettings()
 {
-    return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\CapSwitch", 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return;
+    }
+
+    DWORD value = 0;
+    DWORD valueSize = sizeof(value);
+    if (RegQueryValueExW(key, L"SwitchMethod", nullptr, nullptr,
+        reinterpret_cast<LPBYTE>(&value), &valueSize) == ERROR_SUCCESS &&
+        value <= SwitchMethodWinSpace) {
+        g_switchMethod.store(value);
+    }
+
+    value = 0;
+    valueSize = sizeof(value);
+    if (RegQueryValueExW(key, L"DebugLogging", nullptr, nullptr,
+        reinterpret_cast<LPBYTE>(&value), &valueSize) == ERROR_SUCCESS) {
+        g_debug = value != 0;
+    }
+
+    RegCloseKey(key);
 }
 
-bool IsShiftKey(WPARAM vk)
+void SaveSettings()
 {
-    return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT;
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\CapSwitch", 0, nullptr, 0,
+        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+
+    DWORD value = g_switchMethod.load();
+    RegSetValueExW(key, L"SwitchMethod", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+
+    value = g_debug ? 1u : 0u;
+    RegSetValueExW(key, L"DebugLogging", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+
+    RegCloseKey(key);
 }
 
 bool IsKeyDownMessage(WPARAM message)
@@ -281,11 +425,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
 
     auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
     if (!key || ((key->flags & LLKHF_INJECTED) && key->dwExtraInfo == kInjectedMarker)) {
-        return CallNextHookEx(g_hook, code, wParam, lParam);
-    }
-
-    if (IsCtrlKey(key->vkCode)) {
-        g_ctrlDown.store(IsKeyDownMessage(wParam));
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
@@ -310,8 +449,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
     }
     g_capsDownTick.store(GetTickCount());
 
-    const bool ctrlDown =
-        g_ctrlDown.load() || (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
     if (ctrlDown) {
         PostMessageW(g_window, kCmdToggleEnabled, 0, 0);
@@ -382,6 +520,44 @@ void RemoveTrayIcon()
     }
 }
 
+void OpenLogFile()
+{
+    wchar_t path[1024] = {};
+    if (!GetLogFilePath(path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])))) {
+        return;
+    }
+
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+    }
+
+    wchar_t parameters[1200] = {};
+    _snwprintf_s(parameters, sizeof(parameters) / sizeof(parameters[0]), _TRUNCATE, L"\"%s\"", path);
+    ShellExecuteW(nullptr, L"open", L"notepad.exe", parameters, nullptr, SW_SHOWNORMAL);
+}
+
+void AppendSwitchMethodMenu(HMENU menu)
+{
+    HMENU submenu = CreatePopupMenu();
+    if (!submenu) {
+        return;
+    }
+
+    const DWORD method = g_switchMethod.load();
+    AppendMenuW(submenu, MF_STRING | (method == SwitchMethodMessage ? MF_CHECKED : MF_UNCHECKED),
+        kMenuMethodMsg, L"Window Message");
+    AppendMenuW(submenu, MF_STRING | (method == SwitchMethodAltShift ? MF_CHECKED : MF_UNCHECKED),
+        kMenuMethodAltShift, L"Alt+Shift");
+    AppendMenuW(submenu, MF_STRING | (method == SwitchMethodCtrlShift ? MF_CHECKED : MF_UNCHECKED),
+        kMenuMethodCtrlShift, L"Ctrl+Shift");
+    AppendMenuW(submenu, MF_STRING | (method == SwitchMethodWinSpace ? MF_CHECKED : MF_UNCHECKED),
+        kMenuMethodWinSpace, L"Win+Space");
+
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), L"Switching Method");
+}
+
 void ShowTrayMenu()
 {
     HMENU menu = CreatePopupMenu();
@@ -393,6 +569,10 @@ void ShowTrayMenu()
         g_enabled.load() ? L"Disable CapSwitch" : L"Enable CapSwitch");
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED),
         kMenuToggleStartup, L"Start with Windows");
+    AppendSwitchMethodMenu(menu);
+    AppendMenuW(menu, MF_STRING | (g_debug ? MF_CHECKED : MF_UNCHECKED),
+        kMenuToggleDebug, L"Enable Debug Logging");
+    AppendMenuW(menu, MF_STRING, kMenuOpenLog, L"Open Log File");
     AppendMenuW(menu, MF_STRING, kMenuReloadHook, L"Reload keyboard hook");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"Exit");
@@ -426,6 +606,12 @@ void WatchdogTick()
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (message == g_taskbarCreatedMessage) {
+        AddTrayIcon();
+        UpdateTrayIcon();
+        return 0;
+    }
+
     switch (message) {
     case kCmdSwitchLayout:
         SwitchLayout();
@@ -457,6 +643,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case kMenuToggleStartup:
             SetStartupEnabled(!IsStartupEnabled());
             return 0;
+        case kMenuMethodMsg:
+            g_switchMethod.store(SwitchMethodMessage);
+            SaveSettings();
+            return 0;
+        case kMenuMethodAltShift:
+            g_switchMethod.store(SwitchMethodAltShift);
+            SaveSettings();
+            return 0;
+        case kMenuMethodCtrlShift:
+            g_switchMethod.store(SwitchMethodCtrlShift);
+            SaveSettings();
+            return 0;
+        case kMenuMethodWinSpace:
+            g_switchMethod.store(SwitchMethodWinSpace);
+            SaveSettings();
+            return 0;
+        case kMenuToggleDebug:
+            g_debug = !g_debug;
+            SaveSettings();
+            DebugLog(g_debug ? L"Debug logging enabled" : L"Debug logging disabled");
+            return 0;
+        case kMenuOpenLog:
+            OpenLogFile();
+            return 0;
         case kMenuExit:
             DestroyWindow(hwnd);
             return 0;
@@ -465,14 +675,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
         break;
     case WM_TIMER:
-        if (wParam == kTimerWatchdog || wParam == kTimerResetState) {
+        if (wParam == kTimerWatchdog) {
             WatchdogTick();
             return 0;
         }
         break;
     case WM_DESTROY:
         KillTimer(hwnd, kTimerWatchdog);
-        KillTimer(hwnd, kTimerResetState);
         RemoveTrayIcon();
         RemoveHook();
         PostQuitMessage(0);
@@ -515,8 +724,8 @@ bool CreateMessageWindow()
         return false;
     }
 
-    g_window = CreateWindowExW(0, kWindowClass, kAppName, 0, 0, 0, 0, 0,
-        HWND_MESSAGE, nullptr, g_instance, nullptr);
+    g_window = CreateWindowExW(0, kWindowClass, kAppName, WS_OVERLAPPED,
+        0, 0, 0, 0, nullptr, nullptr, g_instance, nullptr);
     return g_window != nullptr;
 }
 
@@ -528,6 +737,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     g_instance = instance;
+    g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+    LoadSettings();
     ParseCommandLine();
 
     g_mutex = CreateMutexW(nullptr, FALSE, kMutexName);
@@ -551,7 +762,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     AddTrayIcon();
     SetTimer(g_window, kTimerWatchdog, 500, nullptr);
-    SetTimer(g_window, kTimerResetState, 3000, nullptr);
 
     MSG msg = {};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

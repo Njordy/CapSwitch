@@ -13,8 +13,9 @@ no `Win+Space` simulation, no `Alt+Shift` simulation, and no held modifier keys.
 - Physical `CapsLock` is always suppressed.
 - If Windows still manages to enable CapsLock, CapSwitch turns it back off.
 - Tray menu with enable/disable, startup toggle, hook reload, and exit.
+- Selectable switching backends: Window Message, Alt+Shift, Ctrl+Shift, Win+Space.
+- Debug logging can be toggled from the tray menu.
 - Single native x64 executable with no runtime dependencies.
-- Optional debug log.
 
 ## Windows Support
 
@@ -33,7 +34,21 @@ Layout switching is requested directly from the foreground window:
 
 1. Read the foreground window and its input thread.
 2. Find the focused child window when Windows exposes it.
-3. Post `WM_INPUTLANGCHANGEREQUEST` with `HKL_NEXT` to both focused and foreground targets.
+3. Post `WM_INPUTLANGCHANGEREQUEST` with `HKL_NEXT` to the focused target.
+
+The message backend intentionally sends a single layout request. Sending the
+same `HKL_NEXT` request to both focused and foreground windows can switch twice
+in some applications, which looks like no change when only two layouts exist.
+
+Alternative backends are available from the tray menu for systems where the
+message backend is not accepted by a specific app:
+
+- `Alt+Shift`
+- `Ctrl+Shift`
+- `Win+Space`
+
+These alternatives are injected with `SendInput` and marked with CapSwitch's
+internal injected-event marker so the keyboard hook ignores them.
 
 Synthetic keyboard input is used only for one thing: forcing CapsLock off if the
 system state becomes enabled.
@@ -49,6 +64,7 @@ callback small and adds recovery logic:
 - enable/disable also reinstalls the keyboard hook;
 - injected cleanup keystrokes are marked and ignored by the hook;
 - stale internal key state is reset if a key-up event is lost;
+- `Ctrl+CapsLock` reads the live Ctrl key state instead of trusting a stored modifier flag;
 - the tray menu exposes `Reload keyboard hook` for manual recovery.
 
 ## Tray Menu
@@ -57,6 +73,9 @@ Right-click the tray icon:
 
 - `Enable/Disable CapSwitch`
 - `Start with Windows`
+- `Switching Method`
+- `Enable Debug Logging`
+- `Open Log File`
 - `Reload keyboard hook`
 - `Exit`
 
@@ -67,6 +86,17 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 ```
 
 It does not require administrator privileges.
+
+Runtime settings are stored under:
+
+```text
+HKCU\Software\CapSwitch
+```
+
+Values:
+
+- `SwitchMethod`
+- `DebugLogging`
 
 ## Elevated Apps
 
@@ -106,7 +136,7 @@ x64\Release\CapSwitch.exe
 CapSwitch.exe [--debug] [--no-tray]
 ```
 
-- `--debug` writes `%LOCALAPPDATA%\CapSwitch\CapSwitch.log`.
+- `--debug` enables `%LOCALAPPDATA%\CapSwitch\CapSwitch.log` for this run.
 - `--no-tray` runs without a tray icon.
 
 ## License
