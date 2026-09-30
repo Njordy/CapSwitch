@@ -17,3 +17,7 @@
 *.opendb
 *.tlog
 *.log
+
+# Local release bundles, verification binaries and agent settings
+artifacts/
+.claude/

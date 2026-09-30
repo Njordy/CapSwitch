@@ -1,7 +1,10 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
+#include <objbase.h>
 
 #include "resource.h"
+#include "version.h"
 
 #include <atomic>
 #include <cwchar>
@@ -13,7 +16,6 @@ constexpr wchar_t kMutexName[] = L"Local\\CapSwitch.SingleInstance";
 constexpr wchar_t kWindowClass[] = L"CapSwitch.MessageWindow";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCmdSwitchLayout = WM_APP + 2;
-constexpr UINT kCmdToggleEnabled = WM_APP + 3;
 constexpr UINT kCmdForceCapsOff = WM_APP + 4;
 constexpr UINT kMenuToggleEnabled = 1001;
 constexpr UINT kMenuReloadHook = 1002;
@@ -27,6 +29,7 @@ constexpr UINT kMenuToggleDebug = 1014;
 constexpr UINT kMenuOpenLog = 1015;
 constexpr UINT kTimerWatchdog = 1;
 constexpr ULONG_PTR kInjectedMarker = 0x435357544348ULL;
+constexpr LONGLONG kMaxLogBytes = 1024 * 1024;
 
 enum SwitchMethod : DWORD {
     SwitchMethodMessage = 0,
@@ -38,17 +41,19 @@ enum SwitchMethod : DWORD {
 HINSTANCE g_instance = nullptr;
 HWND g_window = nullptr;
 HHOOK g_hook = nullptr;
-HANDLE g_mutex = nullptr;
+HHOOK g_retiredHook = nullptr;
 NOTIFYICONDATAW g_tray = {};
 UINT g_taskbarCreatedMessage = 0;
 
 std::atomic_bool g_enabled{ true };
 std::atomic_bool g_capsDown{ false };
-std::atomic<DWORD> g_capsDownTick{ 0 };
 std::atomic<DWORD> g_switchMethod{ SwitchMethodMessage };
 
 bool g_debug = false;
 bool g_noTray = false;
+bool g_sessionNotifications = false;
+bool g_trayAdded = false;
+HICON g_trayIcon = nullptr;
 
 bool InstallHook();
 
@@ -60,7 +65,9 @@ bool GetLogFilePath(wchar_t* path, DWORD pathCount)
     }
 
     wcscat_s(path, pathCount, L"\\CapSwitch");
-    CreateDirectoryW(path, nullptr);
+    if (!CreateDirectoryW(path, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
     wcscat_s(path, pathCount, L"\\CapSwitch.log");
     return true;
 }
@@ -76,10 +83,29 @@ void DebugLog(const wchar_t* text)
         return;
     }
 
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         return;
+    }
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(file, &size)) {
+        CloseHandle(file);
+        return;
+    }
+    if (size.QuadPart >= kMaxLogBytes - 1024) {
+        CloseHandle(file);
+        wchar_t previous[1032] = {};
+        swprintf_s(previous, L"%s.old", path);
+        if (!MoveFileExW(path, previous, MOVEFILE_REPLACE_EXISTING)) {
+            return; // Never grow an unbounded log if rotation is blocked.
+        }
+        file = CreateFileW(path, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return;
+        }
     }
 
     SYSTEMTIME st = {};
@@ -100,36 +126,75 @@ bool IsCapsLockOn()
     return (GetKeyState(VK_CAPITAL) & 1) != 0;
 }
 
-void SendKey(WORD key, bool down)
+bool AreModifiersDown()
 {
-    INPUT input = {};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wVk = key;
-    input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
-    input.ki.dwExtraInfo = kInjectedMarker;
-    SendInput(1, &input, sizeof(input));
+    const int modifiers[] = { VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN };
+    for (int key : modifiers) {
+        if ((GetAsyncKeyState(key) & 0x8000) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SendKeyBatch(INPUT* inputs, UINT count)
+{
+    const UINT sent = SendInput(count, inputs, sizeof(INPUT));
+    if (sent == count) {
+        return true;
+    }
+    // If only a prefix was inserted, release its unmatched synthetic key-downs.
+    // All callers first exclude keys already held by the user.
+    INPUT releases[16] = {};
+    UINT releaseCount = 0;
+    for (UINT i = sent; i > 0 && i <= count; --i) {
+        const INPUT& input = inputs[i - 1];
+        if ((input.ki.dwFlags & KEYEVENTF_KEYUP) != 0) {
+            continue;
+        }
+        bool released = false;
+        for (UINT j = i; j < sent; ++j) {
+            if (inputs[j].ki.wVk == input.ki.wVk && (inputs[j].ki.dwFlags & KEYEVENTF_KEYUP)) {
+                released = true;
+            }
+        }
+        if (!released && releaseCount < 16) {
+            releases[releaseCount] = input;
+            releases[releaseCount++].ki.dwFlags |= KEYEVENTF_KEYUP;
+        }
+    }
+    if (releaseCount != 0 && SendInput(releaseCount, releases, sizeof(INPUT)) != releaseCount) {
+        DebugLog(L"Synthetic key release was blocked; release the affected keys manually");
+    }
+    return false;
 }
 
 void ForceCapsLockOff()
 {
-    if (!IsCapsLockOn()) {
+    if (AreModifiersDown() || !IsCapsLockOn()) {
         return;
     }
 
     DebugLog(L"CapsLock was on; forcing it off");
-    SendKey(VK_CAPITAL, true);
-    SendKey(VK_CAPITAL, false);
+    INPUT inputs[2] = {};
+    for (auto& input : inputs) {
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_CAPITAL;
+        input.ki.dwExtraInfo = kInjectedMarker;
+    }
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    if (!SendKeyBatch(inputs, 2)) {
+        DebugLog(L"CapsLock correction failed or was blocked");
+    }
 }
 
 void ResetInputState()
 {
     g_capsDown.store(false);
-    g_capsDownTick.store(0);
 }
 
-HWND GetLayoutTargetWindow()
+HWND GetLayoutTargetWindow(HWND foreground)
 {
-    HWND foreground = GetForegroundWindow();
     if (!foreground) {
         return nullptr;
     }
@@ -153,7 +218,10 @@ void RequestLayoutSwitch(HWND hwnd)
         return;
     }
 
-    PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, static_cast<LPARAM>(static_cast<LONG_PTR>(HKL_NEXT)));
+    if (!PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0,
+        static_cast<LPARAM>(static_cast<LONG_PTR>(HKL_NEXT)))) {
+        DebugLog(L"Layout message failed or was blocked");
+    }
 }
 
 const wchar_t* GetSwitchMethodName(DWORD method)
@@ -174,8 +242,15 @@ const wchar_t* GetSwitchMethodName(DWORD method)
 
 void SimulateKeyCombo(const WORD* keys, int count)
 {
-    if (!keys || count <= 0 || count > 8) {
+    if (!keys || count <= 0 || count > 8 || AreModifiersDown()) {
         return;
+    }
+
+    // Do not synthesize a release for a key the user already holds (including Space).
+    for (int i = 0; i < count; ++i) {
+        if ((GetAsyncKeyState(keys[i]) & 0x8000) != 0) {
+            return;
+        }
     }
 
     INPUT inputs[16] = {};
@@ -195,7 +270,9 @@ void SimulateKeyCombo(const WORD* keys, int count)
         ++inputCount;
     }
 
-    SendInput(static_cast<UINT>(inputCount), inputs, sizeof(INPUT));
+    if (!SendKeyBatch(inputs, static_cast<UINT>(inputCount))) {
+        DebugLog(L"Layout shortcut failed or was blocked");
+    }
 }
 
 void LogSwitchDiagnostics(HWND foreground, HWND target, DWORD threadId, DWORD method)
@@ -223,7 +300,7 @@ void LogSwitchDiagnostics(HWND foreground, HWND target, DWORD threadId, DWORD me
 
 void SwitchLayout()
 {
-    if (!g_enabled.load()) {
+    if (!g_enabled.load() || AreModifiersDown()) {
         return;
     }
 
@@ -241,7 +318,7 @@ void SwitchLayout()
         return;
     }
 
-    HWND target = GetLayoutTargetWindow();
+    HWND target = GetLayoutTargetWindow(foreground);
     if (!target) {
         target = foreground;
     }
@@ -278,8 +355,6 @@ void ToggleEnabled()
 {
     const bool enabled = !g_enabled.load();
     g_enabled.store(enabled);
-    InstallHook();
-    ResetInputState();
     ForceCapsLockOff();
     DebugLog(enabled ? L"Enabled" : L"Disabled");
 }
@@ -300,11 +375,12 @@ bool IsStartupEnabled()
 
     wchar_t value[MAX_PATH + 8] = {};
     DWORD valueSize = sizeof(value);
-    const LSTATUS status = RegQueryValueExW(key, kAppName, nullptr, nullptr,
+    DWORD valueType = 0;
+    const LSTATUS status = RegQueryValueExW(key, kAppName, nullptr, &valueType,
         reinterpret_cast<LPBYTE>(value), &valueSize);
     RegCloseKey(key);
 
-    if (status != ERROR_SUCCESS) {
+    if (status != ERROR_SUCCESS || valueType != REG_SZ || valueSize % sizeof(wchar_t) != 0) {
         return false;
     }
 
@@ -359,7 +435,8 @@ bool SetStartupEnabled(bool enabled)
     }
 
     RegCloseKey(key);
-    DebugLog(enabled ? L"Startup enabled" : L"Startup disabled");
+    DebugLog(status == ERROR_SUCCESS ? (enabled ? L"Startup enabled" : L"Startup disabled") :
+        L"Startup setting could not be saved");
     return status == ERROR_SUCCESS;
 }
 
@@ -372,16 +449,19 @@ void LoadSettings()
 
     DWORD value = 0;
     DWORD valueSize = sizeof(value);
-    if (RegQueryValueExW(key, L"SwitchMethod", nullptr, nullptr,
+    DWORD valueType = 0;
+    if (RegQueryValueExW(key, L"SwitchMethod", nullptr, &valueType,
         reinterpret_cast<LPBYTE>(&value), &valueSize) == ERROR_SUCCESS &&
+        valueType == REG_DWORD && valueSize == sizeof(value) &&
         value <= SwitchMethodWinSpace) {
         g_switchMethod.store(value);
     }
 
     value = 0;
     valueSize = sizeof(value);
-    if (RegQueryValueExW(key, L"DebugLogging", nullptr, nullptr,
-        reinterpret_cast<LPBYTE>(&value), &valueSize) == ERROR_SUCCESS) {
+    if (RegQueryValueExW(key, L"DebugLogging", nullptr, &valueType,
+        reinterpret_cast<LPBYTE>(&value), &valueSize) == ERROR_SUCCESS &&
+        valueType == REG_DWORD && valueSize == sizeof(value)) {
         g_debug = value != 0;
     }
 
@@ -393,18 +473,24 @@ void SaveSettings()
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\CapSwitch", 0, nullptr, 0,
         KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        MessageBoxW(g_window, L"Settings apply to this session but could not be saved.",
+            kAppName, MB_OK | MB_ICONERROR);
         return;
     }
 
     DWORD value = g_switchMethod.load();
-    RegSetValueExW(key, L"SwitchMethod", 0, REG_DWORD,
+    const LSTATUS methodStatus = RegSetValueExW(key, L"SwitchMethod", 0, REG_DWORD,
         reinterpret_cast<const BYTE*>(&value), sizeof(value));
 
     value = g_debug ? 1u : 0u;
-    RegSetValueExW(key, L"DebugLogging", 0, REG_DWORD,
+    const LSTATUS debugStatus = RegSetValueExW(key, L"DebugLogging", 0, REG_DWORD,
         reinterpret_cast<const BYTE*>(&value), sizeof(value));
 
     RegCloseKey(key);
+    if (methodStatus != ERROR_SUCCESS || debugStatus != ERROR_SUCCESS) {
+        MessageBoxW(g_window, L"Settings apply to this session but could not be saved.",
+            kAppName, MB_OK | MB_ICONERROR);
+    }
 }
 
 bool IsKeyDownMessage(WPARAM message)
@@ -432,11 +518,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
-    PostMessageW(g_window, kCmdForceCapsOff, 0, 0);
+    // Foreign injected CapsLock events must not release or trigger the physical latch.
+    if ((key->flags & LLKHF_INJECTED) != 0) {
+        return 1;
+    }
 
     if (IsKeyUpMessage(wParam)) {
         g_capsDown.store(false);
-        g_capsDownTick.store(0);
+        PostMessageW(g_window, kCmdForceCapsOff, 0, 0);
         return 1;
     }
 
@@ -447,37 +536,48 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
     if (g_capsDown.exchange(true)) {
         return 1;
     }
-    g_capsDownTick.store(GetTickCount());
-
-    const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-
-    if (ctrlDown) {
-        PostMessageW(g_window, kCmdToggleEnabled, 0, 0);
-    } else if (g_enabled.load()) {
+    PostMessageW(g_window, kCmdForceCapsOff, 0, 0);
+    if (g_enabled.load() && !AreModifiersDown()) {
         PostMessageW(g_window, kCmdSwitchLayout, 0, 0);
     }
 
     return 1;
 }
 
+bool TryRemoveHook(HHOOK& hook)
+{
+    if (!hook) {
+        return true;
+    }
+    if (UnhookWindowsHookEx(hook) || GetLastError() == ERROR_INVALID_HOOK_HANDLE) {
+        hook = nullptr;
+        return true;
+    }
+    DebugLog(L"Hook removal failed; keeping its handle for retry");
+    return false;
+}
+
 bool InstallHook()
 {
-    if (g_hook) {
-        UnhookWindowsHookEx(g_hook);
-        g_hook = nullptr;
+    // Bound ownership even if unhooking unexpectedly fails.
+    if (!TryRemoveHook(g_retiredHook)) {
+        return false;
     }
-
-    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_instance, 0);
-    DebugLog(g_hook ? L"Hook installed" : L"Hook install failed");
-    return g_hook != nullptr;
+    HHOOK replacement = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_instance, 0);
+    if (!replacement) {
+        DebugLog(L"Hook install failed; previous hook retained");
+        return false;
+    }
+    g_retiredHook = g_hook;
+    g_hook = replacement;
+    TryRemoveHook(g_retiredHook);
+    return true;
 }
 
 void RemoveHook()
 {
-    if (g_hook) {
-        UnhookWindowsHookEx(g_hook);
-        g_hook = nullptr;
-    }
+    TryRemoveHook(g_hook);
+    TryRemoveHook(g_retiredHook);
 }
 
 void UpdateTrayIcon()
@@ -486,8 +586,9 @@ void UpdateTrayIcon()
         return;
     }
 
-    g_tray.uFlags = NIF_TIP;
-    swprintf_s(g_tray.szTip, L"CapSwitch: %s", g_enabled.load() ? L"enabled" : L"disabled");
+    g_tray.uFlags = NIF_TIP | NIF_SHOWTIP;
+    swprintf_s(g_tray.szTip, L"CapSwitch %s: %s", CAPSWITCH_VERSION_WSTRING,
+        g_enabled.load() ? L"enabled" : L"disabled");
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
 
@@ -501,22 +602,36 @@ void AddTrayIcon()
     g_tray.cbSize = sizeof(g_tray);
     g_tray.hWnd = g_window;
     g_tray.uID = 1;
-    g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_tray.uCallbackMessage = kTrayMessage;
-    g_tray.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_CAPSWITCH));
+    if (!g_trayIcon) {
+        g_trayIcon = static_cast<HICON>(LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_CAPSWITCH),
+            IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+    }
+    g_tray.hIcon = g_trayIcon;
     if (!g_tray.hIcon) {
         g_tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     }
-    swprintf_s(g_tray.szTip, L"CapSwitch: enabled");
-    Shell_NotifyIconW(NIM_ADD, &g_tray);
+    swprintf_s(g_tray.szTip, L"CapSwitch %s: %s", CAPSWITCH_VERSION_WSTRING,
+        g_enabled.load() ? L"enabled" : L"disabled");
+    g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_tray) != FALSE;
+    if (!g_trayAdded) {
+        DebugLog(L"Tray icon unavailable; watchdog will retry");
+        return;
+    }
     g_tray.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
 }
 
 void RemoveTrayIcon()
 {
-    if (!g_noTray && g_tray.cbSize != 0) {
+    if (g_trayAdded) {
         Shell_NotifyIconW(NIM_DELETE, &g_tray);
+        g_trayAdded = false;
+    }
+    if (g_trayIcon) {
+        DestroyIcon(g_trayIcon);
+        g_trayIcon = nullptr;
     }
 }
 
@@ -535,7 +650,10 @@ void OpenLogFile()
 
     wchar_t parameters[1200] = {};
     _snwprintf_s(parameters, sizeof(parameters) / sizeof(parameters[0]), _TRUNCATE, L"\"%s\"", path);
-    ShellExecuteW(nullptr, L"open", L"notepad.exe", parameters, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(ShellExecuteW(g_window, L"open", L"notepad.exe",
+        parameters, nullptr, SW_SHOWNORMAL)) <= 32) {
+        MessageBoxW(g_window, L"Could not open the log in Notepad.", kAppName, MB_OK | MB_ICONERROR);
+    }
 }
 
 void AppendSwitchMethodMenu(HMENU menu)
@@ -555,7 +673,9 @@ void AppendSwitchMethodMenu(HMENU menu)
     AppendMenuW(submenu, MF_STRING | (method == SwitchMethodWinSpace ? MF_CHECKED : MF_UNCHECKED),
         kMenuMethodWinSpace, L"Win+Space");
 
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), L"Switching Method");
+    if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), L"Switching Method")) {
+        DestroyMenu(submenu);
+    }
 }
 
 void ShowTrayMenu()
@@ -581,6 +701,7 @@ void ShowTrayMenu()
     GetCursorPos(&pt);
     SetForegroundWindow(g_window);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_window, nullptr);
+    PostMessageW(g_window, WM_NULL, 0, 0);
     DestroyMenu(menu);
 }
 
@@ -596,17 +717,20 @@ void WatchdogTick()
         lastReinstall = now;
     }
 
-    const DWORD capsTick = g_capsDownTick.load();
-    if (g_capsDown.load() &&
-        ((GetAsyncKeyState(VK_CAPITAL) & 0x8000) == 0 || (capsTick != 0 && now - capsTick > 1500))) {
-        g_capsDown.store(false);
-        g_capsDownTick.store(0);
+    // A suppressed key has no usable async state. A timeout also breaks long holds.
+    // Only a physical key-up (or a session boundary) releases the latch.
+    if (!g_noTray && !g_trayAdded) {
+        AddTrayIcon();
+    }
+    if (!g_sessionNotifications) {
+        g_sessionNotifications = WTSRegisterSessionNotification(g_window, NOTIFY_FOR_THIS_SESSION) != FALSE;
     }
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
-    if (message == g_taskbarCreatedMessage) {
+    if (g_taskbarCreatedMessage != 0 && message == g_taskbarCreatedMessage) {
+        g_trayAdded = false;
         AddTrayIcon();
         UpdateTrayIcon();
         return 0;
@@ -616,32 +740,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case kCmdSwitchLayout:
         SwitchLayout();
         return 0;
-    case kCmdToggleEnabled:
-        ToggleEnabled();
-        UpdateTrayIcon();
-        return 0;
     case kCmdForceCapsOff:
         ForceCapsLockOff();
         return 0;
     case kTrayMessage:
         if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP) {
             ShowTrayMenu();
-        } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-            PostMessageW(hwnd, kCmdToggleEnabled, 0, 0);
         }
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case kMenuToggleEnabled:
-            PostMessageW(hwnd, kCmdToggleEnabled, 0, 0);
+            ToggleEnabled();
+            UpdateTrayIcon();
             return 0;
         case kMenuReloadHook:
-            InstallHook();
-            ResetInputState();
+            if (!InstallHook()) {
+                MessageBoxW(hwnd, L"Could not reload the keyboard hook. Recovery will retry automatically.",
+                    kAppName, MB_OK | MB_ICONERROR);
+            }
             ForceCapsLockOff();
             return 0;
         case kMenuToggleStartup:
-            SetStartupEnabled(!IsStartupEnabled());
+            if (!SetStartupEnabled(!IsStartupEnabled())) {
+                MessageBoxW(hwnd, L"Could not change the Windows startup setting.",
+                    kAppName, MB_OK | MB_ICONERROR);
+            }
             return 0;
         case kMenuMethodMsg:
             g_switchMethod.store(SwitchMethodMessage);
@@ -660,9 +784,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             SaveSettings();
             return 0;
         case kMenuToggleDebug:
+            if (g_debug) {
+                DebugLog(L"Debug logging disabled");
+            }
             g_debug = !g_debug;
             SaveSettings();
-            DebugLog(g_debug ? L"Debug logging enabled" : L"Debug logging disabled");
+            if (g_debug) {
+                DebugLog(L"Debug logging enabled");
+            }
             return 0;
         case kMenuOpenLog:
             OpenLogFile();
@@ -680,10 +809,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
         break;
+    case WM_WTSSESSION_CHANGE:
+        if (wParam == WTS_SESSION_UNLOCK || wParam == WTS_SESSION_LOGON ||
+            wParam == WTS_CONSOLE_CONNECT || wParam == WTS_REMOTE_CONNECT) {
+            ResetInputState();
+            InstallHook();
+        }
+        return 0;
+    case WM_POWERBROADCAST:
+        if (wParam == PBT_APMRESUMEAUTOMATIC) {
+            ResetInputState();
+            InstallHook();
+        }
+        return TRUE;
     case WM_DESTROY:
         KillTimer(hwnd, kTimerWatchdog);
+        if (g_sessionNotifications) {
+            WTSUnRegisterSessionNotification(hwnd);
+            g_sessionNotifications = false;
+        }
         RemoveTrayIcon();
         RemoveHook();
+        g_window = nullptr;
         PostQuitMessage(0);
         return 0;
     default:
@@ -741,15 +888,37 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     LoadSettings();
     ParseCommandLine();
 
-    g_mutex = CreateMutexW(nullptr, FALSE, kMutexName);
-    if (!g_mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(nullptr, L"CapSwitch is already running.", kAppName, MB_OK | MB_ICONINFORMATION);
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(comResult)) {
+        MessageBoxW(nullptr, L"Failed to initialize Windows shell services.", kAppName, MB_OK | MB_ICONERROR);
         return 1;
+    }
+
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, kMutexName);
+    const DWORD mutexError = GetLastError();
+    const auto cleanup = [mutex](int result) {
+        if (g_window) {
+            DestroyWindow(g_window);
+        }
+        if (mutex) {
+            CloseHandle(mutex);
+        }
+        CoUninitialize();
+        return result;
+    };
+    if (!mutex) {
+        MessageBoxW(nullptr, L"Failed to create the single-instance lock.", kAppName, MB_OK | MB_ICONERROR);
+        return cleanup(1);
+    }
+    if (mutexError == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(nullptr, L"CapSwitch is already running. Exit the existing tray instance first.",
+            kAppName, MB_OK | MB_ICONINFORMATION);
+        return cleanup(1);
     }
 
     if (!CreateMessageWindow()) {
         MessageBoxW(nullptr, L"Failed to create CapSwitch message window.", kAppName, MB_OK | MB_ICONERROR);
-        return 1;
+        return cleanup(1);
     }
 
     ResetInputState();
@@ -757,22 +926,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     if (!InstallHook()) {
         MessageBoxW(nullptr, L"Failed to install the keyboard hook.", kAppName, MB_OK | MB_ICONERROR);
-        return 1;
+        return cleanup(1);
     }
 
     AddTrayIcon();
-    SetTimer(g_window, kTimerWatchdog, 500, nullptr);
+    if (!SetTimer(g_window, kTimerWatchdog, 500, nullptr)) {
+        MessageBoxW(g_window, L"Failed to start the recovery timer.", kAppName, MB_OK | MB_ICONERROR);
+        return cleanup(1);
+    }
+    g_sessionNotifications = WTSRegisterSessionNotification(g_window, NOTIFY_FOR_THIS_SESSION) != FALSE;
+    DebugLog(L"CapSwitch " CAPSWITCH_VERSION_WSTRING L" started");
 
     MSG msg = {};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    BOOL messageResult = 0;
+    while ((messageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    if (g_mutex) {
-        CloseHandle(g_mutex);
-        g_mutex = nullptr;
+    if (messageResult == -1) {
+        MessageBoxW(g_window, L"The Windows message loop failed.", kAppName, MB_OK | MB_ICONERROR);
     }
-
-    return 0;
+    return cleanup(messageResult == -1 ? 1 : 0);
 }
