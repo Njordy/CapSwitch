@@ -2,6 +2,9 @@
 #include <shellapi.h>
 #include <wtsapi32.h>
 #include <objbase.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <wrl/client.h>
 
 #include "resource.h"
 #include "version.h"
@@ -15,7 +18,7 @@ constexpr wchar_t kAppName[] = L"CapSwitch";
 constexpr wchar_t kMutexName[] = L"Local\\CapSwitch.SingleInstance";
 constexpr wchar_t kWindowClass[] = L"CapSwitch.MessageWindow";
 constexpr UINT kTrayMessage = WM_APP + 1;
-constexpr UINT kCmdSwitchLayout = WM_APP + 2;
+constexpr UINT kCmdCapsAction = WM_APP + 2;
 constexpr UINT kCmdForceCapsOff = WM_APP + 4;
 constexpr UINT kMenuToggleEnabled = 1001;
 constexpr UINT kMenuReloadHook = 1002;
@@ -27,6 +30,9 @@ constexpr UINT kMenuMethodCtrlShift = 1012;
 constexpr UINT kMenuMethodWinSpace = 1013;
 constexpr UINT kMenuToggleDebug = 1014;
 constexpr UINT kMenuOpenLog = 1015;
+constexpr UINT kMenuActionLayout = 1020;
+constexpr UINT kMenuActionMute = 1021;
+constexpr UINT kMenuActionNothing = 1022;
 constexpr UINT kTimerWatchdog = 1;
 constexpr ULONG_PTR kInjectedMarker = 0x435357544348ULL;
 constexpr LONGLONG kMaxLogBytes = 1024 * 1024;
@@ -36,6 +42,12 @@ enum SwitchMethod : DWORD {
     SwitchMethodAltShift = 1,
     SwitchMethodCtrlShift = 2,
     SwitchMethodWinSpace = 3,
+};
+
+enum CapsAction : DWORD {
+    CapsActionLayout = 0,
+    CapsActionMute = 1,
+    CapsActionNothing = 2,
 };
 
 HINSTANCE g_instance = nullptr;
@@ -48,11 +60,14 @@ UINT g_taskbarCreatedMessage = 0;
 std::atomic_bool g_enabled{ true };
 std::atomic_bool g_capsDown{ false };
 std::atomic<DWORD> g_switchMethod{ SwitchMethodMessage };
+std::atomic<DWORD> g_capsAction{ CapsActionLayout };
 
 bool g_debug = false;
 bool g_noTray = false;
 bool g_sessionNotifications = false;
 bool g_trayAdded = false;
+bool g_trayVersion4 = false;
+bool g_menuTracking = false;
 HICON g_trayIcon = nullptr;
 
 bool InstallHook();
@@ -359,6 +374,63 @@ void ToggleEnabled()
     DebugLog(enabled ? L"Enabled" : L"Disabled");
 }
 
+const wchar_t* GetCapsActionName(DWORD action)
+{
+    switch (action) {
+    case CapsActionLayout: return L"Switch keyboard layout";
+    case CapsActionMute: return L"Toggle sound mute";
+    case CapsActionNothing: return L"Nothing (CapsLock blocked)";
+    default: return L"Unknown";
+    }
+}
+
+HRESULT ToggleEndpointMute(IAudioEndpointVolume* volume)
+{
+    if (!volume) {
+        return E_POINTER;
+    }
+    BOOL muted = FALSE;
+    HRESULT result = volume->GetMute(&muted);
+    return SUCCEEDED(result) ? volume->SetMute(!muted, nullptr) : result;
+}
+
+HRESULT ToggleAudioMute()
+{
+    // Resolve the current default output every time, including after device changes.
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT result = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(enumerator.GetAddressOf()));
+    if (FAILED(result)) { return result; }
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    result = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.GetAddressOf());
+    if (FAILED(result)) { return result; }
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
+    result = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, nullptr,
+        reinterpret_cast<void**>(volume.GetAddressOf()));
+    return SUCCEEDED(result) ? ToggleEndpointMute(volume.Get()) : result;
+}
+
+void PerformCapsAction(DWORD requestedAction)
+{
+    // A queued press must not acquire a different meaning after a menu change.
+    if (!g_enabled.load() || requestedAction != g_capsAction.load() || AreModifiersDown()) {
+        return;
+    }
+    switch (requestedAction) {
+    case CapsActionLayout:
+        SwitchLayout();
+        break;
+    case CapsActionMute:
+        if (FAILED(ToggleAudioMute())) {
+            DebugLog(L"Could not toggle mute on the default output device");
+        }
+        break;
+    case CapsActionNothing:
+    default:
+        break;
+    }
+}
+
 bool GetExecutablePath(wchar_t* path, DWORD pathCount)
 {
     const DWORD len = GetModuleFileNameW(nullptr, path, pathCount);
@@ -450,6 +522,13 @@ void LoadSettings()
     DWORD value = 0;
     DWORD valueSize = sizeof(value);
     DWORD valueType = 0;
+    if (RegQueryValueExW(key, L"CapsAction", nullptr, &valueType,
+        reinterpret_cast<LPBYTE>(&value), &valueSize) == ERROR_SUCCESS &&
+        valueType == REG_DWORD && valueSize == sizeof(value) && value <= CapsActionNothing) {
+        g_capsAction.store(value);
+    }
+    value = 0;
+    valueSize = sizeof(value);
     if (RegQueryValueExW(key, L"SwitchMethod", nullptr, &valueType,
         reinterpret_cast<LPBYTE>(&value), &valueSize) == ERROR_SUCCESS &&
         valueType == REG_DWORD && valueSize == sizeof(value) &&
@@ -478,7 +557,10 @@ void SaveSettings()
         return;
     }
 
-    DWORD value = g_switchMethod.load();
+    DWORD value = g_capsAction.load();
+    const LSTATUS actionStatus = RegSetValueExW(key, L"CapsAction", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    value = g_switchMethod.load();
     const LSTATUS methodStatus = RegSetValueExW(key, L"SwitchMethod", 0, REG_DWORD,
         reinterpret_cast<const BYTE*>(&value), sizeof(value));
 
@@ -487,7 +569,7 @@ void SaveSettings()
         reinterpret_cast<const BYTE*>(&value), sizeof(value));
 
     RegCloseKey(key);
-    if (methodStatus != ERROR_SUCCESS || debugStatus != ERROR_SUCCESS) {
+    if (actionStatus != ERROR_SUCCESS || methodStatus != ERROR_SUCCESS || debugStatus != ERROR_SUCCESS) {
         MessageBoxW(g_window, L"Settings apply to this session but could not be saved.",
             kAppName, MB_OK | MB_ICONERROR);
     }
@@ -537,8 +619,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
         return 1;
     }
     PostMessageW(g_window, kCmdForceCapsOff, 0, 0);
-    if (g_enabled.load() && !AreModifiersDown()) {
-        PostMessageW(g_window, kCmdSwitchLayout, 0, 0);
+    const DWORD action = g_capsAction.load();
+    if (g_enabled.load() && action != CapsActionNothing && !AreModifiersDown()) {
+        PostMessageW(g_window, kCmdCapsAction, action, 0);
     }
 
     return 1;
@@ -588,7 +671,7 @@ void UpdateTrayIcon()
 
     g_tray.uFlags = NIF_TIP | NIF_SHOWTIP;
     swprintf_s(g_tray.szTip, L"CapSwitch %s: %s", CAPSWITCH_VERSION_WSTRING,
-        g_enabled.load() ? L"enabled" : L"disabled");
+        g_enabled.load() ? GetCapsActionName(g_capsAction.load()) : L"Paused (CapsLock blocked)");
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
 
@@ -613,14 +696,14 @@ void AddTrayIcon()
         g_tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     }
     swprintf_s(g_tray.szTip, L"CapSwitch %s: %s", CAPSWITCH_VERSION_WSTRING,
-        g_enabled.load() ? L"enabled" : L"disabled");
+        g_enabled.load() ? GetCapsActionName(g_capsAction.load()) : L"Paused (CapsLock blocked)");
     g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_tray) != FALSE;
     if (!g_trayAdded) {
         DebugLog(L"Tray icon unavailable; watchdog will retry");
         return;
     }
     g_tray.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
+    g_trayVersion4 = Shell_NotifyIconW(NIM_SETVERSION, &g_tray) != FALSE;
 }
 
 void RemoveTrayIcon()
@@ -673,22 +756,45 @@ void AppendSwitchMethodMenu(HMENU menu)
     AppendMenuW(submenu, MF_STRING | (method == SwitchMethodWinSpace ? MF_CHECKED : MF_UNCHECKED),
         kMenuMethodWinSpace, L"Win+Space");
 
-    if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), L"Switching Method")) {
+    const UINT flags = MF_POPUP | (g_capsAction.load() == CapsActionLayout ? 0 : MF_GRAYED);
+    if (!AppendMenuW(menu, flags, reinterpret_cast<UINT_PTR>(submenu), L"Layout Switching Method")) {
+        DestroyMenu(submenu);
+    }
+}
+
+void AppendCapsActionMenu(HMENU menu)
+{
+    HMENU submenu = CreatePopupMenu();
+    if (!submenu) { return; }
+    AppendMenuW(submenu, MF_STRING, kMenuActionLayout, L"Switch keyboard layout (default)");
+    AppendMenuW(submenu, MF_STRING, kMenuActionMute, L"Toggle sound mute");
+    AppendMenuW(submenu, MF_STRING, kMenuActionNothing, L"Nothing (disable CapsLock)");
+    CheckMenuRadioItem(submenu, kMenuActionLayout, kMenuActionNothing,
+        kMenuActionLayout + g_capsAction.load(), MF_BYCOMMAND);
+    if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), L"CapsLock Action")) {
         DestroyMenu(submenu);
     }
 }
 
 void ShowTrayMenu()
 {
+    if (g_menuTracking) {
+        return;
+    }
+    g_menuTracking = true;
+    struct TrackingGuard {
+        ~TrackingGuard() { g_menuTracking = false; }
+    } trackingGuard;
     HMENU menu = CreatePopupMenu();
     if (!menu) {
         return;
     }
 
     AppendMenuW(menu, MF_STRING, kMenuToggleEnabled,
-        g_enabled.load() ? L"Disable CapSwitch" : L"Enable CapSwitch");
+        g_enabled.load() ? L"Pause CapsLock action" : L"Resume CapsLock action");
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED),
         kMenuToggleStartup, L"Start with Windows");
+    AppendCapsActionMenu(menu);
     AppendSwitchMethodMenu(menu);
     AppendMenuW(menu, MF_STRING | (g_debug ? MF_CHECKED : MF_UNCHECKED),
         kMenuToggleDebug, L"Enable Debug Logging");
@@ -700,9 +806,17 @@ void ShowTrayMenu()
     POINT pt = {};
     GetCursorPos(&pt);
     SetForegroundWindow(g_window);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_window, nullptr);
+    const UINT command = static_cast<UINT>(TrackPopupMenu(menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_window, nullptr));
     PostMessageW(g_window, WM_NULL, 0, 0);
     DestroyMenu(menu);
+    // Apply selection now rather than queuing WM_COMMAND behind tray notifications.
+    if (command != 0) {
+        SendMessageW(g_window, WM_COMMAND, command, 0);
+    }
+    if (g_trayAdded) {
+        Shell_NotifyIconW(NIM_SETFOCUS, &g_tray);
+    }
 }
 
 void WatchdogTick()
@@ -737,21 +851,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
 
     switch (message) {
-    case kCmdSwitchLayout:
-        SwitchLayout();
+    case kCmdCapsAction:
+        PerformCapsAction(static_cast<DWORD>(wParam));
         return 0;
     case kCmdForceCapsOff:
         ForceCapsLockOff();
         return 0;
     case kTrayMessage:
-        if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP) {
-            ShowTrayMenu();
+        {
+            const UINT event = g_trayVersion4 ? LOWORD(lParam) : static_cast<UINT>(lParam);
+            const UINT iconId = g_trayVersion4 ? HIWORD(lParam) : static_cast<UINT>(wParam);
+            const UINT contextEvent = g_trayVersion4 ? WM_CONTEXTMENU : WM_RBUTTONUP;
+            if (iconId == g_tray.uID && event == contextEvent) {
+                ShowTrayMenu();
+            }
         }
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case kMenuToggleEnabled:
             ToggleEnabled();
+            UpdateTrayIcon();
+            return 0;
+        case kMenuActionLayout:
+        case kMenuActionMute:
+        case kMenuActionNothing:
+            g_capsAction.store(LOWORD(wParam) - kMenuActionLayout);
+            SaveSettings();
             UpdateTrayIcon();
             return 0;
         case kMenuReloadHook:
